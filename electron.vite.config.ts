@@ -28,6 +28,22 @@ export default defineConfig({
         '@shared': resolve('src/shared')
       }
     },
+    server: {
+      // Pre-compile every entry while vite boots: the prebuilt toolbar window
+      // requests its page right after electron spawns, and a cold on-demand
+      // compile left selections "dead" for the first tens of seconds.
+      warmup: {
+        clientFiles: [
+          './settings.html',
+          './selectionToolbar.html',
+          './selectionAction.html',
+          './chat.html',
+          './screenshotOverlay.html',
+          './screenshotPreview.html',
+          './screenshotPin.html'
+        ]
+      }
+    },
     build: {
       rollupOptions: {
         input: {

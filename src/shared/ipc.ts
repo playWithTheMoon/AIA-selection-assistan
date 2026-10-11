@@ -12,6 +12,7 @@ export const IPC = {
   SelectionProcessAction: 'selection:process-action',
   SelectionGetInitialAction: 'selection:get-initial-action',
   SelectionWriteClipboard: 'selection:write-clipboard',
+  SelectionReplaceSelection: 'selection:replace-selection',
   SelectionGetAccessibility: 'selection:get-accessibility',
   SelectionRequestAccessibility: 'selection:request-accessibility',
 
@@ -29,6 +30,16 @@ export const IPC = {
   WindowPin: 'window:pin',
   OpenExternal: 'app:open-external',
 
+  ClipboardReadImage: 'clipboard:read-image',
+
+  PreWindowSave: 'pre-window:save',
+  PreWindowList: 'pre-window:list',
+  PreWindowRemove: 'pre-window:remove',
+  PreWindowChanged: 'pre-window:changed',
+  LastSelectionGet: 'context:last-selection',
+
+  ChatOpen: 'chat:open',
+
   ScreenshotStart: 'screenshot:start',
   ScreenshotOverlayReady: 'screenshot:overlay-ready',
   ScreenshotOverlayInit: 'screenshot:overlay-init',
@@ -42,7 +53,11 @@ export const IPC = {
   ScreenshotPinZoom: 'screenshot:pin-zoom',
   ScreenshotPinMove: 'screenshot:pin-move',
   ScreenshotPinMenu: 'screenshot:pin-menu',
-  ScreenshotExplain: 'screenshot:explain'
+  ScreenshotExplain: 'screenshot:explain',
+
+  HotkeyCaptureStart: 'hotkey-capture:start',
+  HotkeyCaptureStop: 'hotkey-capture:stop',
+  HotkeyCaptured: 'hotkey-captured'
 } as const
 
 export type IpcName = (typeof IPC)[keyof typeof IPC]

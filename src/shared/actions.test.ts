@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   buildAssistantSystemPrompt,
+  buildContextInjectionPrompt,
   buildSearchUrl,
   interpolatePrompt,
   isUriOrFilePath,
@@ -184,6 +185,73 @@ describe('selection actions', () => {
     expect(normalized.autoLaunch).toBe(false)
   })
 
+  it('falls back to hide for missing or invalid actionWindowClose', () => {
+    const { actionWindowClose: _c, ...oldSettings } = defaultSettings
+    expect(normalizeSettings(oldSettings).actionWindowClose).toBe('hide')
+    expect(normalizeSettings({ ...defaultSettings, actionWindowClose: 'explode' as never }).actionWindowClose).toBe(
+      'hide'
+    )
+  })
+
+  it('keeps a valid destroy actionWindowClose', () => {
+    expect(normalizeSettings({ ...defaultSettings, actionWindowClose: 'destroy' }).actionWindowClose).toBe('destroy')
+  })
+
+  it('falls back to abort for missing or invalid raceResponse', () => {
+    const { raceResponse: _r, ...oldSettings } = defaultSettings
+    expect(normalizeSettings(oldSettings).raceResponse).toBe('abort')
+    expect(normalizeSettings({ ...defaultSettings, raceResponse: 'turbo' as never }).raceResponse).toBe('abort')
+  })
+
+  it('keeps a valid complete raceResponse', () => {
+    expect(normalizeSettings({ ...defaultSettings, raceResponse: 'complete' }).raceResponse).toBe('complete')
+  })
+
+  it('falls back to enabled for missing or invalid prebuildActionWindow', () => {
+    const { prebuildActionWindow: _p, ...oldSettings } = defaultSettings
+    expect(normalizeSettings(oldSettings).prebuildActionWindow).toBe(true)
+    expect(normalizeSettings({ ...defaultSettings, prebuildActionWindow: 'yes' as never }).prebuildActionWindow).toBe(
+      true
+    )
+  })
+
+  it('keeps a valid false prebuildActionWindow', () => {
+    expect(normalizeSettings({ ...defaultSettings, prebuildActionWindow: false }).prebuildActionWindow).toBe(false)
+  })
+
+  it('falls back to disabled for missing or invalid statsEnabled', () => {
+    const { statsEnabled: _s, ...oldSettings } = defaultSettings
+    expect(normalizeSettings(oldSettings).statsEnabled).toBe(false)
+    expect(normalizeSettings({ ...defaultSettings, statsEnabled: 'yes' as never }).statsEnabled).toBe(false)
+  })
+
+  it('keeps a valid true statsEnabled', () => {
+    expect(normalizeSettings({ ...defaultSettings, statsEnabled: true }).statsEnabled).toBe(true)
+  })
+
+  it('falls back to full for missing or invalid statsDetailLevel', () => {
+    const { statsDetailLevel: _d, ...oldSettings } = defaultSettings
+    expect(normalizeSettings(oldSettings).statsDetailLevel).toBe('full')
+    expect(normalizeSettings({ ...defaultSettings, statsDetailLevel: 'everything' as never }).statsDetailLevel).toBe(
+      'full'
+    )
+  })
+
+  it('keeps a valid noSource statsDetailLevel', () => {
+    expect(normalizeSettings({ ...defaultSettings, statsDetailLevel: 'noSource' }).statsDetailLevel).toBe('noSource')
+  })
+
+  it('falls back to enter for missing or invalid sendKey', () => {
+    const { sendKey: _k, ...oldSettings } = defaultSettings
+    expect(normalizeSettings(oldSettings).sendKey).toBe('enter')
+    expect(normalizeSettings({ ...defaultSettings, sendKey: 'altEnter' as never }).sendKey).toBe('enter')
+  })
+
+  it('keeps valid non-default sendKey modes', () => {
+    expect(normalizeSettings({ ...defaultSettings, sendKey: 'ctrlEnter' }).sendKey).toBe('ctrlEnter')
+    expect(normalizeSettings({ ...defaultSettings, sendKey: 'shiftEnter' }).sendKey).toBe('shiftEnter')
+  })
+
   it('forces provider temperature to 1 during normalization', () => {
     const normalized = normalizeSettings({
       ...defaultSettings,
@@ -309,5 +377,96 @@ describe('selection actions', () => {
     expect(merged.actions.find((action) => action.id === 'translate')?.promptTemplate).toBe(
       defaultSettings.actions.find((action) => action.id === 'translate')?.promptTemplate
     )
+  })
+
+  it('falls back to all fields for missing or invalid contextInjectionFields', () => {
+    const { contextInjectionFields: _f, ...oldSettings } = defaultSettings
+    expect(normalizeSettings(oldSettings).contextInjectionFields).toEqual(['sourceApp', 'localTime', 'localPlace'])
+    expect(
+      normalizeSettings({ ...defaultSettings, contextInjectionFields: ['sourceApp', 'bogus' as never] })
+        .contextInjectionFields
+    ).toEqual(['sourceApp'])
+  })
+
+  it('keeps an explicit empty contextInjectionFields array', () => {
+    expect(normalizeSettings({ ...defaultSettings, contextInjectionFields: [] }).contextInjectionFields).toEqual([])
+  })
+
+  it('falls back to disabled for missing or invalid contextInjectionEnabled', () => {
+    const { contextInjectionEnabled: _e, ...oldSettings } = defaultSettings
+    expect(normalizeSettings(oldSettings).contextInjectionEnabled).toBe(false)
+    expect(normalizeSettings({ ...defaultSettings, contextInjectionEnabled: 'yes' as never }).contextInjectionEnabled).toBe(
+      false
+    )
+  })
+})
+
+describe('context injection prompt', () => {
+  const base = {
+    enabled: true,
+    fields: ['sourceApp', 'localTime', 'localPlace'] as ('sourceApp' | 'localTime' | 'localPlace')[],
+    language: 'zh-CN' as const,
+    programName: 'Code.exe',
+    now: new Date('2026-10-10T07:30:45Z'),
+    timeZone: 'Asia/Shanghai'
+  }
+
+  it('returns an empty prompt when disabled', () => {
+    expect(buildContextInjectionPrompt({ ...base, enabled: false })).toBe('')
+  })
+
+  it('returns an empty prompt when no fields are ticked', () => {
+    expect(buildContextInjectionPrompt({ ...base, fields: [] })).toBe('')
+  })
+
+  it('includes source app, local time and timezone when enabled', () => {
+    const prompt = buildContextInjectionPrompt(base)
+    expect(prompt).toContain('Code.exe')
+    expect(prompt).toContain('Asia/Shanghai')
+    // Asia/Shanghai is UTC+8: 07:30Z renders as 15:30 local (24-hour clock).
+    expect(prompt).toContain('15:30')
+  })
+
+  it('skips the source app line when the request carries no program name', () => {
+    const prompt = buildContextInjectionPrompt({ ...base, programName: undefined })
+    expect(prompt).not.toContain('Code.exe')
+    expect(prompt).toContain('Asia/Shanghai')
+  })
+
+  it('renders the English variant for English settings', () => {
+    const prompt = buildContextInjectionPrompt({ ...base, language: 'en' })
+    expect(prompt).toContain('Source app: Code.exe')
+    expect(prompt).toContain('Time zone: Asia/Shanghai')
+    expect(prompt).not.toContain('来源应用')
+  })
+})
+
+describe('quote action settings round-trip', () => {
+  const quoteAction = {
+    id: 'my-quote',
+    name: 'My Quote',
+    enabled: false,
+    icon: 'bookmark',
+    type: 'quote' as const,
+    shortcut: 'Ctrl+Q'
+  }
+
+  it('keeps a customized quote action through a settings round-trip', () => {
+    const merged = mergeSettings(defaultSettings, { actions: [quoteAction] })
+    const kept = merged.actions.find((action) => action.id === 'my-quote')
+    expect(kept).toMatchObject({ type: 'quote', enabled: false, name: 'My Quote', shortcut: 'Ctrl+Q' })
+  })
+
+  it('keeps a customized built-in quote action through a round-trip', () => {
+    // The real regression: the built-in quote customized by the user (disabled,
+    // renamed, rebound) must survive normalization as-is. Pre-fix,
+    // normalizeActionType dropped 'quote' and the migration re-added a fresh
+    // default copy instead — which this test now distinguishes.
+    const customizedActions = defaultSettings.actions.map((action) =>
+      action.type === 'quote' ? { ...action, name: 'My Quote', enabled: false, shortcut: 'Ctrl+Q' } : action
+    )
+    const merged = mergeSettings({ ...defaultSettings, actions: customizedActions }, {})
+    const kept = merged.actions.find((action) => action.type === 'quote')
+    expect(kept).toMatchObject({ name: 'My Quote', enabled: false, shortcut: 'Ctrl+Q' })
   })
 })

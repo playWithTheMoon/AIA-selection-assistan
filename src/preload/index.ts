@@ -5,6 +5,9 @@ import type {
   AiChunkPayload,
   AiStreamRequest,
   AppSettings,
+  LastSelection,
+  PreWindowEntry,
+  ReplaceSelectionResult,
   SelectedTextPayload,
   SettingsPatch
 } from '@shared/types'
@@ -26,6 +29,12 @@ const api = {
     stop: (): Promise<void> => ipcRenderer.invoke(IPC.SelectionStop),
     hideToolbar: (): Promise<void> => ipcRenderer.invoke(IPC.SelectionHideToolbar),
     writeClipboard: (text: string): Promise<boolean> => ipcRenderer.invoke(IPC.SelectionWriteClipboard, text),
+    replaceSelection: (payload: {
+      text: string
+      selectedText: string
+      programName?: string
+      hwnd?: number | null
+    }): Promise<ReplaceSelectionResult> => ipcRenderer.invoke(IPC.SelectionReplaceSelection, payload),
     determineToolbarSize: (width: number): Promise<void> => ipcRenderer.invoke(IPC.SelectionDetermineToolbarSize, width),
     processAction: (payload: ActionPayload): Promise<void> => ipcRenderer.invoke(IPC.SelectionProcessAction, payload),
     getAccessibility: (): Promise<boolean> => ipcRenderer.invoke(IPC.SelectionGetAccessibility),
@@ -74,13 +83,42 @@ const api = {
     speak: (text: string): Promise<boolean> => ipcRenderer.invoke(IPC.SpeechSpeak, text),
     stop: (): Promise<void> => ipcRenderer.invoke(IPC.SpeechStop)
   },
+  hotkeyCapture: {
+    start: (): Promise<number | null> => ipcRenderer.invoke(IPC.HotkeyCaptureStart),
+    stop: (): Promise<void> => ipcRenderer.invoke(IPC.HotkeyCaptureStop),
+    onCaptured: (callback: (token: number, accelerator: string) => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, token: number, accelerator: string) => callback(token, accelerator)
+      ipcRenderer.on(IPC.HotkeyCaptured, listener)
+      return () => {
+        ipcRenderer.off(IPC.HotkeyCaptured, listener)
+      }
+    }
+  },
   windowControls: {
     close: (): Promise<void> => ipcRenderer.invoke(IPC.WindowClose),
     minimize: (): Promise<void> => ipcRenderer.invoke(IPC.WindowMinimize),
     pin: (pinned: boolean): Promise<void> => ipcRenderer.invoke(IPC.WindowPin, pinned)
   },
   app: {
-    openExternal: (url: string): Promise<void> => ipcRenderer.invoke(IPC.OpenExternal, url)
+    openExternal: (url: string): Promise<void> => ipcRenderer.invoke(IPC.OpenExternal, url),
+    readClipboardImage: (): Promise<string | null> => ipcRenderer.invoke(IPC.ClipboardReadImage)
+  },
+  preWindow: {
+    save: (entry: { text: string; programName?: string }): Promise<PreWindowEntry> =>
+      ipcRenderer.invoke(IPC.PreWindowSave, entry),
+    list: (): Promise<PreWindowEntry[]> => ipcRenderer.invoke(IPC.PreWindowList),
+    remove: (id: string): Promise<boolean> => ipcRenderer.invoke(IPC.PreWindowRemove, id),
+    onChange: (callback: () => void): (() => void) => {
+      const listener = () => callback()
+      ipcRenderer.on(IPC.PreWindowChanged, listener)
+      return () => ipcRenderer.removeListener(IPC.PreWindowChanged, listener)
+    }
+  },
+  context: {
+    getLastSelection: (): Promise<LastSelection | null> => ipcRenderer.invoke(IPC.LastSelectionGet)
+  },
+  chat: {
+    open: (): Promise<void> => ipcRenderer.invoke(IPC.ChatOpen)
   },
   screenshot: {
     start: (): Promise<void> => ipcRenderer.invoke(IPC.ScreenshotStart),

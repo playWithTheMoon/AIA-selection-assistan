@@ -9,3 +9,8 @@ export function shouldProcessProgram(programName: string | undefined, mode: Filt
   if (mode === 'blacklist') return !found
   return true
 }
+
+export function isOwnProgram(programName: string | undefined, ownProgramName: string): boolean {
+  if (!programName) return false
+  return programName.toLowerCase() === ownProgramName.toLowerCase()
+}

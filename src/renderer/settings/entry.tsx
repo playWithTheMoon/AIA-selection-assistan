@@ -4,22 +4,30 @@ import { createRoot } from 'react-dom/client'
 import { useSettings } from '../useSettings'
 import { Icon } from '../icons'
 import { defaultActions } from '@shared/defaults'
+import { buildAccelerator as buildShortcutAccelerator } from '@shared/shortcutRule'
 import { useThemeMode } from '../useThemeMode'
 import { useAppearance } from '../useAppearance'
 import { getActionLabel, getTranslator } from '../i18n'
 import { ProviderNameInput } from './ProviderNameInput'
 import type {
   ActionItem,
+  ActionWindowCloseMode,
   AppLanguage,
+  AppSettings,
+  ContextInjectionField,
   FilterMode,
   ProviderTemplate,
+  RaceResponseMode,
   ReasoningMode,
+  SendKeyMode,
   ShortcutSettings,
+  StatsDetailLevel,
+  StructuredOutputMode,
   ThemeMode,
   TriggerMode
 } from '@shared/types'
 
-type SettingsSectionId = 'api' | 'actions' | 'selection' | 'window'
+type SettingsSectionId = 'api' | 'actions' | 'selection' | 'window' | 'storage'
 
 type SettingsSectionMeta = {
   id: SettingsSectionId
@@ -78,13 +86,24 @@ function SettingRow({ title, description, className, children }: SettingRowProps
   )
 }
 
-function Toggle({ checked, onChange, label }: { checked: boolean; onChange: (checked: boolean) => void; label: string }) {
+function Toggle({
+  checked,
+  onChange,
+  label,
+  disabled
+}: {
+  checked: boolean
+  onChange: (checked: boolean) => void
+  label: string
+  disabled?: boolean
+}) {
   return (
     <button
       aria-checked={checked}
       aria-label={label}
       className={checked ? 'toggle checked' : 'toggle'}
       onClick={() => onChange(!checked)}
+      disabled={disabled}
       role="switch"
       type="button">
       <span />
@@ -135,6 +154,57 @@ function formatShortcut(value: string): string[] {
     .filter(Boolean)
 }
 
+// 应用内快捷键互斥：12 个可配点（4 全局键 + 全部 action）
+// 共用一个键空间，同一组合键配给第二个功能时注册链只第一个生效、其余静默
+// 失效（src/main/index.ts registerShortcuts 现状）——保存前在此拦下并提示冲突对象。
+// 比较前 trim + 大写归一：两条录入通道产出统一格式（全大写），归一只防手工
+// 编辑设置文件带入空白或小写。
+function findShortcutConflict(
+  settings: AppSettings,
+  excludeKey: string,
+  newValue: string,
+  t: (key: string) => string
+): string | null {
+  const normalizedNew = newValue.trim().toUpperCase()
+  if (!normalizedNew) return null
+
+  const occupants: Array<{ key: string; accelerator: string; label: string }> = [
+    {
+      key: 'shortcut:toggleAssistant',
+      accelerator: settings.shortcuts.toggleAssistant,
+      label: t('shortcutToggleAssistant')
+    },
+    {
+      key: 'shortcut:processSelection',
+      accelerator: settings.shortcuts.processSelection,
+      label: t('shortcutProcessSelection')
+    },
+    {
+      key: 'shortcut:captureScreen',
+      accelerator: settings.shortcuts.captureScreen,
+      label: t('shortcutCaptureScreen')
+    },
+    {
+      key: 'shortcut:chat',
+      accelerator: settings.shortcuts.chat,
+      label: t('shortcutChat')
+    }
+  ]
+  for (const action of settings.actions) {
+    occupants.push({
+      key: `action:${action.id}`,
+      accelerator: action.shortcut ?? '',
+      label: getActionLabel(action, settings.language)
+    })
+  }
+
+  for (const occupant of occupants) {
+    if (occupant.key === excludeKey) continue
+    if (occupant.accelerator.trim().toUpperCase() === normalizedNew) return occupant.label
+  }
+  return null
+}
+
 function normalizeShortcutKey(event: React.KeyboardEvent<HTMLButtonElement>): string {
   const keyMap: Record<string, string> = {
     ' ': 'Space',
@@ -149,27 +219,68 @@ function normalizeShortcutKey(event: React.KeyboardEvent<HTMLButtonElement>): st
   const modifierKeys = new Set(['Alt', 'AltGraph', 'Control', 'Meta', 'Shift'])
   if (modifierKeys.has(key)) return ''
 
-  const parts: string[] = []
-  if (event.metaKey || event.ctrlKey) parts.push('CommandOrControl')
-  if (event.altKey) parts.push('Alt')
-  if (event.shiftKey) parts.push('Shift')
-  parts.push(key)
-  if (parts.length === 1 && !/^F\d{1,2}$/.test(key)) return ''
-  return parts.join('+')
+  // 组合顺序与单键合法性走 @shared/shortcutRule：原先本地 F\d{1,2} 放行
+  // F13-F99，而 main 侧只认 F1-F12，录出的是永不触发的快捷键。
+  return (
+    buildShortcutAccelerator(
+      { commandOrControl: event.metaKey || event.ctrlKey, alt: event.altKey, shift: event.shiftKey },
+      key
+    ) ?? ''
+  )
 }
 
 function ShortcutRecorder({
   value,
   label,
+  conflictText,
   onChange,
   t
 }: {
   value: string
   label: string
+  /** 应用内快捷键冲突提示（互斥校验被拒时由父层传入）；空 = 无冲突 */
+  conflictText?: string
   onChange: (value: string) => void
   t: (key: string) => string
 }) {
   const [recording, setRecording] = React.useState(false)
+  // Dual capture channels: the main-process hook sees keys Windows
+  // intercepts before they reach the renderer (Alt+Space); the local keydown
+  // below stays as fallback and covers normal keys. handledRef keeps both
+  // channels from committing the same keystroke twice; the session token keeps
+  // sibling recorders on the same page from accepting each other's capture
+  // (many components share the page-level IPC channel). The captured listener
+  // lives for the whole component on purpose: intercepting keys (Alt+Space)
+  // also opens the system menu, and the resulting blur tears down recording —
+  // a recording-scoped listener would be removed before the IPC event lands.
+  const handledRef = React.useRef(false)
+  const captureTokenRef = React.useRef<number | null>(null)
+  const onChangeRef = React.useRef(onChange)
+  onChangeRef.current = onChange
+
+  React.useEffect(() => {
+    const offCaptured = window.assistantLite.hotkeyCapture.onCaptured((token, accelerator) => {
+      if (handledRef.current || token !== captureTokenRef.current) return
+      handledRef.current = true
+      captureTokenRef.current = null
+      onChangeRef.current(accelerator)
+      setRecording(false)
+    })
+    return offCaptured
+  }, [])
+
+  React.useEffect(() => {
+    if (!recording) return
+    handledRef.current = false
+    void window.assistantLite.hotkeyCapture.start().then((token) => {
+      captureTokenRef.current = token
+    })
+    return () => {
+      captureTokenRef.current = null
+      void window.assistantLite.hotkeyCapture.stop()
+    }
+  }, [recording])
+
   const parts = formatShortcut(value)
 
   return (
@@ -198,6 +309,7 @@ function ShortcutRecorder({
 
           const shortcut = normalizeShortcutKey(event)
           if (!shortcut) return
+          handledRef.current = true
           onChange(shortcut)
           setRecording(false)
         }}>
@@ -218,6 +330,7 @@ function ShortcutRecorder({
           {t('shortcutClear')}
         </button>
       )}
+      {conflictText && <div className="shortcut-conflict">{conflictText}</div>}
     </div>
   )
 }
@@ -425,6 +538,9 @@ function SettingsApp() {
   const [modelsByTemplate, setModelsByTemplate] = React.useState<Record<string, string[]>>({})
   const [statusByTemplate, setStatusByTemplate] = React.useState<Record<string, string>>({})
   const [busyTemplate, setBusyTemplate] = React.useState<{ id: string; kind: 'list' | 'test' } | null>(null)
+  // 快捷键互斥：只记最后一条被拒的冲突（一次只操作一个录制框）。
+  // targetKey 命中哪个录制框，红字就挂在哪个框下；任何一次成功保存即清除。
+  const [shortcutConflict, setShortcutConflict] = React.useState<{ targetKey: string; text: string } | null>(null)
   const t = getTranslator(settings.language)
   useThemeMode(settings.theme)
   useAppearance(settings)
@@ -546,14 +662,44 @@ function SettingsApp() {
   }
 
   const updateShortcut = (field: keyof ShortcutSettings, value: string) => {
+    const conflictLabel = findShortcutConflict(settings, `shortcut:${field}`, value, t)
+    if (conflictLabel) {
+      setShortcutConflict({
+        targetKey: `shortcut:${field}`,
+        text: t('shortcutConflictHint').replace('{name}', conflictLabel)
+      })
+      return
+    }
+    setShortcutConflict(null)
     void update({ shortcuts: { [field]: value } })
+  }
+
+  const updateContextInjectionField = (field: ContextInjectionField, on: boolean) => {
+    const next = on
+      ? [...new Set([...settings.contextInjectionFields, field])]
+      : settings.contextInjectionFields.filter((ticked) => ticked !== field)
+    void update({ contextInjectionFields: next })
+  }
+
+  const updateActionShortcut = (id: string, value: string) => {
+    const conflictLabel = findShortcutConflict(settings, `action:${id}`, value, t)
+    if (conflictLabel) {
+      setShortcutConflict({
+        targetKey: `action:${id}`,
+        text: t('shortcutConflictHint').replace('{name}', conflictLabel)
+      })
+      return
+    }
+    setShortcutConflict(null)
+    updateAction(id, { shortcut: value || undefined })
   }
 
   const sections: SettingsSectionMeta[] = [
     { id: 'api', label: t('sectionApi') },
     { id: 'actions', label: t('sectionActions') },
     { id: 'selection', label: t('sectionSelection') },
-    { id: 'window', label: t('sectionWindow') }
+    { id: 'window', label: t('sectionWindow') },
+    { id: 'storage', label: t('sectionStorage') }
   ]
   const defaultActionById = new Map(defaultActions.map((action) => [action.id, action]))
   const filterText = settings.filterList.join('\n')
@@ -729,6 +875,13 @@ function SettingsApp() {
                 <option value="shortcut">{t('triggerShortcut')}</option>
               </select>
             </SettingRow>
+            <SettingRow title={t('selectAllTrigger')} description={t('selectAllTriggerDesc')}>
+              <Toggle
+                checked={settings.selectAllTrigger}
+                label={t('selectAllTrigger')}
+                onChange={(selectAllTrigger) => update({ selectAllTrigger })}
+              />
+            </SettingRow>
           </SettingSection>
 
           <SettingSection title={t('selectionShortcutGroup')}>
@@ -736,6 +889,9 @@ function SettingsApp() {
               <ShortcutRecorder
                 value={settings.shortcuts.toggleAssistant}
                 label={t('shortcutToggleAssistant')}
+                conflictText={
+                  shortcutConflict?.targetKey === 'shortcut:toggleAssistant' ? shortcutConflict.text : undefined
+                }
                 onChange={(value) => updateShortcut('toggleAssistant', value)}
                 t={t}
               />
@@ -747,6 +903,9 @@ function SettingsApp() {
               <ShortcutRecorder
                 value={settings.shortcuts.processSelection}
                 label={t('shortcutProcessSelection')}
+                conflictText={
+                  shortcutConflict?.targetKey === 'shortcut:processSelection' ? shortcutConflict.text : undefined
+                }
                 onChange={(value) => updateShortcut('processSelection', value)}
                 t={t}
               />
@@ -758,6 +917,9 @@ function SettingsApp() {
               <ShortcutRecorder
                 value={settings.shortcuts.captureScreen}
                 label={t('shortcutCaptureScreen')}
+                conflictText={
+                  shortcutConflict?.targetKey === 'shortcut:captureScreen' ? shortcutConflict.text : undefined
+                }
                 onChange={(value) => updateShortcut('captureScreen', value)}
                 t={t}
               />
@@ -769,6 +931,7 @@ function SettingsApp() {
               <ShortcutRecorder
                 value={settings.shortcuts.chat}
                 label={t('shortcutChat')}
+                conflictText={shortcutConflict?.targetKey === 'shortcut:chat' ? shortcutConflict.text : undefined}
                 onChange={(value) => updateShortcut('chat', value)}
                 t={t}
               />
@@ -785,7 +948,10 @@ function SettingsApp() {
                 <ShortcutRecorder
                   value={action.shortcut ?? ''}
                   label={getActionLabel(action, settings.language)}
-                  onChange={(value) => updateAction(action.id, { shortcut: value || undefined })}
+                  conflictText={
+                    shortcutConflict?.targetKey === `action:${action.id}` ? shortcutConflict.text : undefined
+                  }
+                  onChange={(value) => updateActionShortcut(action.id, value)}
                   t={t}
                 />
               </SettingRow>
@@ -856,6 +1022,51 @@ function SettingsApp() {
             <SettingRow title={t('autoPin')}>
               <Toggle checked={settings.autoPin} label={t('autoPin')} onChange={(autoPin) => update({ autoPin })} />
             </SettingRow>
+            <SettingRow title={t('actionWindowClose')} description={t('actionWindowCloseDesc')}>
+              <select
+                value={settings.actionWindowClose}
+                onChange={(event) => update({ actionWindowClose: event.target.value as ActionWindowCloseMode })}
+              >
+                <option value="hide">{t('actionWindowCloseHide')}</option>
+                <option value="destroy">{t('actionWindowCloseDestroy')}</option>
+              </select>
+            </SettingRow>
+            <SettingRow title={t('raceResponse')} description={t('raceResponseDesc')}>
+              <select
+                value={settings.raceResponse}
+                onChange={(event) => update({ raceResponse: event.target.value as RaceResponseMode })}
+              >
+                <option value="abort">{t('raceResponseAbort')}</option>
+                <option value="complete">{t('raceResponseComplete')}</option>
+              </select>
+            </SettingRow>
+            <SettingRow title={t('structuredOutputMode')} description={t('structuredOutputModeDesc')}>
+              <select
+                value={settings.structuredOutputMode}
+                onChange={(event) => update({ structuredOutputMode: event.target.value as StructuredOutputMode })}
+              >
+                <option value="json_schema">{t('structuredOutputModeJsonSchema')}</option>
+                <option value="json_object">{t('structuredOutputModeJsonObject')}</option>
+                <option value="off">{t('structuredOutputModeOff')}</option>
+              </select>
+            </SettingRow>
+            <SettingRow title={t('sendKey')} description={t('sendKeyDesc')}>
+              <select
+                value={settings.sendKey}
+                onChange={(event) => update({ sendKey: event.target.value as SendKeyMode })}
+              >
+                <option value="enter">{t('sendKeyEnter')}</option>
+                <option value="ctrlEnter">{t('sendKeyCtrlEnter')}</option>
+                <option value="shiftEnter">{t('sendKeyShiftEnter')}</option>
+              </select>
+            </SettingRow>
+            <SettingRow title={t('prebuildActionWindow')} description={t('prebuildActionWindowDesc')}>
+              <Toggle
+                checked={settings.prebuildActionWindow}
+                label={t('prebuildActionWindow')}
+                onChange={(prebuildActionWindow) => update({ prebuildActionWindow })}
+              />
+            </SettingRow>
           </SettingSection>
 
           <SettingSection title={t('appearanceSizeGroup')}>
@@ -887,6 +1098,69 @@ function SettingsApp() {
             </SettingRow>
             <SettingRow title={t('fontSize')}>
               <NumberField value={settings.fontSize} min={10} max={28} onCommit={(fontSize) => update({ fontSize })} />
+            </SettingRow>
+          </SettingSection>
+        </div>
+      )
+    }
+
+    if (activeSection === 'storage') {
+      return (
+        <div className="settings-stack">
+          <SettingSection title={t('storageGroup')}>
+            <SettingRow title={t('statsEnabled')} description={t('statsEnabledDesc')}>
+              <Toggle
+                checked={settings.statsEnabled}
+                label={t('statsEnabled')}
+                onChange={(statsEnabled) => update({ statsEnabled })}
+              />
+            </SettingRow>
+            <SettingRow title={t('statsDetailLevel')} description={t('statsDetailLevelDesc')}>
+              <select
+                value={settings.statsDetailLevel}
+                onChange={(event) => update({ statsDetailLevel: event.target.value as StatsDetailLevel })}
+              >
+                <option value="full">{t('statsDetailFull')}</option>
+                <option value="noSource">{t('statsDetailNoSource')}</option>
+              </select>
+            </SettingRow>
+          </SettingSection>
+
+          <SettingSection title={t('contextInjectionGroup')}>
+            <SettingRow title={t('contextInjectionEnabled')} description={t('contextInjectionEnabledDesc')}>
+              <Toggle
+                checked={settings.contextInjectionEnabled}
+                label={t('contextInjectionEnabled')}
+                onChange={(contextInjectionEnabled) => update({ contextInjectionEnabled })}
+              />
+            </SettingRow>
+            <SettingRow
+              title={t('contextInjectionFieldSourceApp')}
+              description={t('contextInjectionFieldSourceAppDesc')}>
+              <Toggle
+                checked={settings.contextInjectionFields.includes('sourceApp')}
+                label={t('contextInjectionFieldSourceApp')}
+                disabled={!settings.contextInjectionEnabled}
+                onChange={(on) => updateContextInjectionField('sourceApp', on)}
+              />
+            </SettingRow>
+            <SettingRow title={t('contextInjectionFieldLocalTime')} description={t('contextInjectionFieldLocalTimeDesc')}>
+              <Toggle
+                checked={settings.contextInjectionFields.includes('localTime')}
+                label={t('contextInjectionFieldLocalTime')}
+                disabled={!settings.contextInjectionEnabled}
+                onChange={(on) => updateContextInjectionField('localTime', on)}
+              />
+            </SettingRow>
+            <SettingRow
+              title={t('contextInjectionFieldLocalPlace')}
+              description={t('contextInjectionFieldLocalPlaceDesc')}>
+              <Toggle
+                checked={settings.contextInjectionFields.includes('localPlace')}
+                label={t('contextInjectionFieldLocalPlace')}
+                disabled={!settings.contextInjectionEnabled}
+                onChange={(on) => updateContextInjectionField('localPlace', on)}
+              />
             </SettingRow>
           </SettingSection>
         </div>

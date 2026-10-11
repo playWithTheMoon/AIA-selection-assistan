@@ -1,4 +1,5 @@
 import type { ActionItem, AppSettings, ProviderTemplate } from './types'
+import { DEFAULT_STRUCTURED_OUTPUT_MODE } from './structuredOutput'
 
 export const defaultActions: ActionItem[] = [
   {
@@ -58,6 +59,13 @@ export const defaultActions: ActionItem[] = [
     type: 'prompt',
     promptTemplate:
       'Rewrite the following text to be clearer, smoother, and more natural while preserving its original meaning. Keep the tone appropriate to the source and do not add new information.\n\n{{text}}'
+  },
+  {
+    id: 'quote',
+    name: 'Pre-select',
+    enabled: true,
+    icon: 'quote',
+    type: 'quote'
   }
 ]
 
@@ -78,12 +86,26 @@ export const defaultSettings: AppSettings = {
   theme: 'system',
   enabled: false,
   triggerMode: 'selected',
+  // Default on: the fork author's primary use case; users can turn it off in
+  // settings (non-text Ctrl+A stays silent because no text selection exists).
+  selectAllTrigger: true,
   compactToolbar: false,
   showToolbarAppIcon: true,
   followToolbar: true,
   rememberWindowSize: false,
   autoClose: false,
   autoPin: false,
+  actionWindowClose: 'hide',
+  raceResponse: 'abort',
+  prebuildActionWindow: true,
+  statsEnabled: false,
+  statsDetailLevel: 'full',
+  // Context injection: off by default (the leak is certain, the benefit
+  // only possible). Field ticks default to all three so turning the master
+  // switch on yields the full feature without hunting for every checkbox.
+  contextInjectionEnabled: false,
+  contextInjectionFields: ['sourceApp', 'localTime', 'localPlace'],
+  sendKey: 'enter',
   actionWindowWidth: 560,
   actionWindowHeight: 420,
   fontFamily: '',
@@ -95,6 +117,7 @@ export const defaultSettings: AppSettings = {
   providerTemplates: [defaultProviderTemplate],
   activeProviderTemplateId: defaultProviderTemplate.id,
   webSearchEnabled: true,
+  structuredOutputMode: DEFAULT_STRUCTURED_OUTPUT_MODE,
   shortcuts: {
     toggleAssistant: 'CommandOrControl+Shift+Space',
     processSelection: 'CommandOrControl+Shift+S',

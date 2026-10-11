@@ -45,7 +45,8 @@
     "react-dom": "^18.3.1",
     "react-markdown": "^10.1.0",
     "remark-gfm": "^4.0.1",
-    "selection-hook": "2.0.1"
+    "selection-hook": "file:./third_party/selection-hook",
+    "uiohook-napi": "^1.5.5"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
@@ -63,7 +64,8 @@
     "onlyBuiltDependencies": [
       "electron",
       "esbuild",
-      "selection-hook"
+      "selection-hook",
+      "uiohook-napi"
     ]
   }
 }

@@ -1,4 +1,5 @@
 import type { AiMessageInput, ProviderApiType, ProviderSettings, ReasoningMode } from '@shared/types'
+import { REPLACEMENT_SCHEMA, type StructuredOutputMode } from '@shared/structuredOutput'
 
 export class AiConfigurationError extends Error {}
 const ANTHROPIC_VERSION = '2023-06-01'
@@ -7,6 +8,13 @@ export type ProviderFetch = (input: string, init?: RequestInit) => Promise<Respo
 
 export interface ProviderRequestOptions {
   readonly fetcher?: ProviderFetch
+  /** Request-level flag: the caller decided this stream must be structured
+   * (prompt injection happens in the AiStream handler). Drives max_tokens on
+   * the Anthropic path. */
+  readonly structuredOutput?: boolean
+  /** Settings-level server-side strength. 'off' sends no structuring
+   * parameters; anything the provider rejects fails loudly upstream. */
+  readonly structuredOutputMode?: StructuredOutputMode
 }
 
 export function normalizeBaseUrl(baseUrl: string): string {
@@ -121,7 +129,7 @@ export function parseAnthropicStreamEvent(raw: string): StreamDelta | null {
     try {
       const parsed = JSON.parse(payload) as {
         type?: string
-        delta?: { type?: string; text?: string; thinking?: string }
+        delta?: { type?: string; text?: string; thinking?: string; partial_json?: string }
       }
 
       if (parsed.type === 'content_block_delta' && parsed.delta) {
@@ -130,6 +138,16 @@ export function parseAnthropicStreamEvent(raw: string): StreamDelta | null {
         }
         if (parsed.delta.type === 'thinking_delta' && parsed.delta.thinking) {
           return { reasoning: parsed.delta.thinking }
+        }
+        // Structured requests (tool_choice) stream the tool arguments as JSON
+        // fragments. Mapping them onto `content` lets the whole downstream
+        // pipeline (incremental extraction, final parse) stay shared with the
+        // OpenAI path. Anthropic documents partial_json as incremental pieces
+        // to concatenate; if a provider ever sends cumulative snapshots
+        // instead, the symptom is duplicated text in the result window —
+        // re-verify here.
+        if (parsed.delta.type === 'input_json_delta' && parsed.delta.partial_json) {
+          return { content: parsed.delta.partial_json }
         }
       }
     } catch {
@@ -227,18 +245,35 @@ export async function streamChatMessages(
 ): Promise<void> {
   assertProviderReady(provider)
 
+  const structured = options.structuredOutput === true
+  const structuredMode: StructuredOutputMode = options.structuredOutputMode ?? 'off'
   const body: Record<string, unknown> =
     provider.apiType === 'anthropic'
       ? {
           model: provider.model,
           temperature: provider.temperature,
-          max_tokens: 1024,
+          // Structured output arrives wrapped in JSON escaping plus the note
+          // field; 1024 truncates it mid-JSON (the parse fallback would catch
+          // it, but the whole feature degrades for long selections).
+          max_tokens: structured ? 4096 : 1024,
           stream: true,
           system: systemPrompt,
           messages: messages.map((message) => ({
             role: message.role,
             content: buildAnthropicContent(message)
-          }))
+          })),
+          ...(structured && structuredMode === 'json_schema'
+            ? {
+                tools: [
+                  {
+                    name: 'structured_output',
+                    description: 'Return the action result in a structured form.',
+                    input_schema: REPLACEMENT_SCHEMA
+                  }
+                ],
+                tool_choice: { type: 'tool', name: 'structured_output' }
+              }
+            : {})
         }
       : {
           model: provider.model,
@@ -250,7 +285,18 @@ export async function streamChatMessages(
               role: message.role,
               content: buildOpenAIContent(message)
             }))
-          ]
+          ],
+          ...(structured && structuredMode === 'json_object'
+            ? { response_format: { type: 'json_object' } }
+            : {}),
+          ...(structured && structuredMode === 'json_schema'
+            ? {
+                response_format: {
+                  type: 'json_schema',
+                  json_schema: { name: 'structured_output', strict: true, schema: REPLACEMENT_SCHEMA }
+                }
+              }
+            : {})
         }
   applyReasoning(body, provider.apiType, reasoning)
 

@@ -13,6 +13,7 @@ import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { IPC } from '@shared/ipc'
 import type { AppSettings } from '@shared/types'
+import { loadRenderer } from './loadRenderer'
 import { isMac } from './platform'
 
 export interface OverlayInitPayload {
@@ -209,7 +210,7 @@ export class ScreenshotService {
       if (this.overlayWindow === overlay) this.overlayWindow = null
     })
 
-    this.loadRenderer(overlay, 'screenshotOverlay.html')
+    loadRenderer(overlay, this.rendererDir, 'screenshotOverlay.html')
     overlay.once('ready-to-show', () => {
       overlay.show()
       // On Windows the taskbar will otherwise float above a normal
@@ -315,7 +316,7 @@ export class ScreenshotService {
     win.on('closed', () => {
       if (this.previewWindow === win) this.previewWindow = null
     })
-    this.loadRenderer(win, 'screenshotPreview.html')
+    loadRenderer(win, this.rendererDir, 'screenshotPreview.html')
     win.webContents.once('did-finish-load', () => {
       win.webContents.send(IPC.ScreenshotPreviewInit, payload)
       win.show()
@@ -437,7 +438,7 @@ export class ScreenshotService {
       maxScale
     })
     pin.on('closed', () => this.pinWindows.delete(pin))
-    this.loadRenderer(pin, 'screenshotPin.html')
+    loadRenderer(pin, this.rendererDir, 'screenshotPin.html')
     pin.webContents.once('did-finish-load', () => {
       // Re-assert alwaysOnTop after content loads — on Windows the initial
       // call can be lost for transparent windows, causing the pin to fall
@@ -539,13 +540,5 @@ export class ScreenshotService {
       height: state.baseHeight
     })
     win.setOpacity(1)
-  }
-
-  private loadRenderer(win: BrowserWindow, page: string): void {
-    if (process.env.ELECTRON_RENDERER_URL) {
-      void win.loadURL(`${process.env.ELECTRON_RENDERER_URL}/${page}`)
-    } else {
-      void win.loadFile(join(this.rendererDir, page))
-    }
   }
 }

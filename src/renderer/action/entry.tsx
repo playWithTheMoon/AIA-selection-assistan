@@ -2,14 +2,26 @@ import '../styles.css'
 import React from 'react'
 import { createRoot } from 'react-dom/client'
 import { buildSearchUrl, interpolatePrompt } from '@shared/actions'
-import type { ActionItem, ActionPayload, AiChunkPayload, AppSettings } from '@shared/types'
-import { MarkdownView } from '../Markdown'
+import { extractPartialReplacement, parseStructuredReplacement, STRUCTURED_OUTPUT_ACTION_IDS } from '@shared/structuredOutput'
+import type {
+  ActionItem,
+  ActionPayload,
+  AiChunkPayload,
+  AiStreamStatsContext,
+  AppSettings
+} from '@shared/types'
 import { ReasoningLine, ReasoningSummary } from '../ReasoningLine'
 import { Icon } from '../icons'
 import { useSettings } from '../useSettings'
 import { useThemeMode } from '../useThemeMode'
 import { useAppearance } from '../useAppearance'
 import { getActionLabel, getTranslator } from '../i18n'
+import { AttachmentStrip, filesToDataUrls, historyTurnMessages, imageFilesFromPaste, userMessageWithImages } from '../inputAttachments'
+import { matchesSendKey } from '../sendKey'
+
+// Lazy so the markdown toolchain (~374 kB) stays out of the first-screen chunk;
+// it loads when the first AI answer renders.
+const MarkdownView = React.lazy(() => import('../Markdown').then((m) => ({ default: m.MarkdownView })))
 
 interface ChatTurn {
   role: 'user' | 'assistant'
@@ -25,6 +37,13 @@ interface ChatTurn {
   reasoningStart?: number
   /** Seconds spent thinking, frozen when the first content delta lands. */
   reasoningTime?: number
+  /** True when the model output follows the structured replacement contract
+   * (replace-capable actions); `text` then holds the raw JSON output. */
+  structured?: boolean
+  /** Data URLs the user attached to this follow-up turn. Kept on the turn so
+   * later follow-up requests re-send them (memory only, like the rest of the
+   * conversation). */
+  images?: string[]
 }
 
 type Translator = (key: string) => string
@@ -35,6 +54,10 @@ interface ResultProps {
   t: Translator
   pinned: boolean
   togglePin: () => void
+  /** Issue #7 paste-back: the app-level blur handler must not auto-close the
+   * window while a replace is running — focusWindow intentionally steals
+   * focus, and with autoClose on that blur would kill the failure hint. */
+  onReplaceStateChange?: (busy: boolean) => void
 }
 
 const isMac = navigator.userAgent.includes('Mac OS X')
@@ -53,7 +76,7 @@ function Titlebar({
   t: Translator
 }) {
   return (
-    <div className="titlebar">
+    <div className={isMac ? 'titlebar' : 'titlebar titlebar--flush'}>
       <Icon name={icon} />
       <strong>{title}</strong>
       <button className="icon" title={pinned ? t('unpin') : t('pin')} onClick={togglePin}>
@@ -62,9 +85,9 @@ function Titlebar({
       {!isMac && (
         <>
           <button className="icon" title={t('minimize')} onClick={() => window.assistantLite.windowControls.minimize()}>
-            <span>-</span>
+            <Icon name="minus" />
           </button>
-          <button className="icon" title={t('close')} onClick={() => window.assistantLite.windowControls.close()}>
+          <button className="icon titlebar-close" title={t('close')} onClick={() => window.assistantLite.windowControls.close()}>
             <Icon name="x" />
           </button>
         </>
@@ -76,7 +99,11 @@ function Titlebar({
 // Shared streaming state for a single action's result window. Each request
 // carries the action's chosen provider and reasoning mode. Hidden user turns
 // (the interpolated prompt) feed the model but are not rendered.
-function useActionStream(action: ActionItem, t: Translator) {
+function useActionStream(
+  action: ActionItem,
+  t: Translator,
+  statsSelection?: { programName?: string; selectedText: string }
+) {
   const [chat, setChat] = React.useState<ChatTurn[]>([])
   const chatRef = React.useRef<ChatTurn[]>([])
   const activeRequestId = React.useRef<string | null>(null)
@@ -92,23 +119,39 @@ function useActionStream(action: ActionItem, t: Translator) {
         if (!current.length) return current
         const next = [...current]
         const last = { ...next[next.length - 1] }
-        if (chunk.type === 'delta') {
-          last.text += chunk.text ?? ''
-          if (last.reasoningStart !== undefined && last.reasoningTime === undefined) {
-            last.reasoningTime = (Date.now() - last.reasoningStart) / 1000
+        // Exhaustive over AiChunkPayload.type: a newly added chunk kind must
+        // be handled here — the never assignment below turns "silently
+        // ignored by every window" into a compile error.
+        switch (chunk.type) {
+          case 'delta': {
+            last.text += chunk.text ?? ''
+            if (last.reasoningStart !== undefined && last.reasoningTime === undefined) {
+              last.reasoningTime = (Date.now() - last.reasoningStart) / 1000
+            }
+            last.pending = true
+            break
           }
-          last.pending = true
-        } else if (chunk.type === 'reasoning') {
-          last.reasoning = (last.reasoning ?? '') + (chunk.reasoning ?? '')
-          if (last.reasoningStart === undefined) last.reasoningStart = Date.now()
-          last.pending = true
-        } else if (chunk.type === 'status') {
-          last.searchQuery = chunk.text ?? ''
-        } else if (chunk.type === 'done') {
-          last.pending = false
-        } else if (chunk.type === 'error') {
-          last.pending = false
-          last.error = chunk.error ?? t('unknownProviderError')
+          case 'reasoning': {
+            last.reasoning = (last.reasoning ?? '') + (chunk.reasoning ?? '')
+            if (last.reasoningStart === undefined) last.reasoningStart = Date.now()
+            last.pending = true
+            break
+          }
+          case 'status':
+            last.searchQuery = chunk.text ?? ''
+            break
+          case 'done':
+            last.pending = false
+            break
+          case 'error':
+            last.pending = false
+            last.error = chunk.error ?? t('unknownProviderError')
+            break
+          default: {
+            const unhandledChunkType: never = chunk.type
+            console.warn('[action] unhandled ai chunk type:', unhandledChunkType)
+            break
+          }
         }
         next[next.length - 1] = last
         return next
@@ -123,27 +166,48 @@ function useActionStream(action: ActionItem, t: Translator) {
   // ref to avoid running side-effects inside a setState updater (which would
   // double-fire under StrictMode and could issue duplicate streams).
   const send = React.useCallback(
-    (opts: { sendText: string; display?: string; hidden?: boolean; reset?: boolean }) => {
+    (opts: { sendText: string; display?: string; hidden?: boolean; reset?: boolean; images?: string[] }) => {
       const history = opts.reset ? [] : chatRef.current
       const messages = [
-        ...history.map((turn) => ({ role: turn.role, text: turn.text })),
-        { role: 'user' as const, text: opts.sendText }
+        ...historyTurnMessages(history),
+        userMessageWithImages(opts.sendText, opts.images ?? [])
       ]
       const requestId = crypto.randomUUID()
       activeRequestId.current = requestId
+      // Attach selection context so main can record this action run.
+      // Follow-up turns carry the same selection — every turn is one record.
+      let stats: AiStreamStatsContext | undefined
+      if (statsSelection) {
+        stats = {
+          programName: statsSelection.programName,
+          actionName: action.name,
+          actionType: action.type,
+          selectedText: statsSelection.selectedText
+        }
+      }
       void window.assistantLite.ai.stream({
         requestId,
         messages,
         providerTemplateId: action.providerTemplateId,
-        reasoning: action.reasoning
+        reasoning: action.reasoning,
+        stats,
+        structuredOutput: isStructuredAction(action)
       })
       setChat([
         ...history,
-        { role: 'user', text: opts.sendText, display: opts.display, hidden: opts.hidden },
-        { role: 'assistant', text: '', pending: true }
+        // Copy the attachment list: the turn must keep the images that were
+        // current at send time, independent of later edits to the state.
+        {
+          role: 'user',
+          text: opts.sendText,
+          display: opts.display,
+          hidden: opts.hidden,
+          ...(opts.images?.length ? { images: [...opts.images] } : {})
+        },
+        { role: 'assistant', text: '', pending: true, structured: isStructuredAction(action) }
       ])
     },
-    [action]
+    [action, statsSelection]
   )
 
   const stop = React.useCallback(() => {
@@ -196,6 +260,10 @@ function ChatTurns({
     <>
       {chat.map((turn, index) => {
         if (turn.role === 'assistant') {
+          const noteText =
+            turn.structured && !turn.pending && !turn.error
+              ? parseStructuredReplacement(turn.text).note
+              : null
           return (
             <div key={index} className="result markdown-body">
               {turn.searchQuery && (
@@ -207,7 +275,9 @@ function ChatTurns({
                 <ReasoningSummary seconds={turn.reasoningTime} label={isZh ? '思考了' : 'Thought for'} />
               )}
               {turn.text ? (
-                <MarkdownView>{turn.text}</MarkdownView>
+                <React.Suspense fallback={null}>
+                  <MarkdownView>{structuredDisplayText(turn)}</MarkdownView>
+                </React.Suspense>
               ) : turn.pending && showThinking ? (
                 <ReasoningLine
                   reasoning={turn.reasoning}
@@ -216,6 +286,7 @@ function ChatTurns({
                   label={isZh ? '思考中' : 'Thinking…'}
                 />
               ) : null}
+              {noteText && <div className="note-hint">{noteText}</div>}
               {turn.error && <div className="error">{turn.error}</div>}
             </div>
           )
@@ -231,21 +302,47 @@ function ChatTurns({
   )
 }
 
+// Replace-capable actions produce structured output (replacement + note JSON);
+// everything else keeps the legacy full-text behavior.
+function isStructuredAction(action: ActionItem): boolean {
+  return STRUCTURED_OUTPUT_ACTION_IDS.includes(action.id)
+}
+
+// Structured turns hold the raw model output in `text`; the replacement field
+// is the paste-back/copy surface. A degraded parse falls back to the raw text,
+// byte-identical to the legacy behavior.
+function getReplacementText(turn: ChatTurn): string {
+  if (!turn.structured) return turn.text
+  return parseStructuredReplacement(turn.text).replacement
+}
+
+// Streaming display for structured turns: while the model is still writing,
+// surface the replacement value incrementally (falling back to the raw stream
+// whenever the value cannot be isolated yet); once done, show only the parsed
+// replacement. Degraded output shows the full raw text, as before.
+function structuredDisplayText(turn: ChatTurn): string {
+  if (!turn.structured) return turn.text
+  if (turn.pending) return extractPartialReplacement(turn.text) ?? turn.text
+  return parseStructuredReplacement(turn.text).replacement
+}
+
 function copyLastResult(chat: ChatTurn[]): void {
   const last = [...chat].reverse().find((turn) => turn.role === 'assistant' && turn.text)
-  if (last) void navigator.clipboard.writeText(last.text)
+  if (last) void navigator.clipboard.writeText(getReplacementText(last))
 }
 
 // Selection mode: run the action on the selected text immediately, then allow
 // follow-up questions in the same window.
-function SelectionResult({ payload, settings, t, pinned, togglePin }: ResultProps) {
+function SelectionResult({ payload, settings, t, pinned, togglePin, onReplaceStateChange }: ResultProps) {
   const isZh = settings.language === 'zh-CN'
   // With reasoning off the answer streams back almost immediately, so the
   // "Thinking…" placeholder is just a flash of noise — only show it when on.
   const showThinking = (payload.action.reasoning ?? 'on') !== 'off'
-  const { chat, send, stop, loading, hasResult } = useActionStream(payload.action, t)
+  const statsSelection = { programName: payload.programName, selectedText: payload.selectedText }
+  const { chat, send, stop, loading, hasResult } = useActionStream(payload.action, t, statsSelection)
   const [askOpen, setAskOpen] = React.useState(false)
   const [askText, setAskText] = React.useState('')
+  const [attachments, setAttachments] = React.useState<string[]>([])
   const askInputRef = React.useRef<HTMLInputElement>(null)
   const contentRef = React.useRef<HTMLDivElement>(null)
   const stick = useAutoScroll(contentRef, chat)
@@ -267,11 +364,83 @@ function SelectionResult({ payload, settings, t, pinned, togglePin }: ResultProp
 
   const submitAsk = () => {
     const text = askText.trim()
-    if (!text || loading) return
+    if ((!text && attachments.length === 0) || loading) return
     setAskText('')
     setAskOpen(false)
     stick.current = true
-    send({ sendText: text, display: text })
+    send({ sendText: text, display: text, images: attachments })
+    setAttachments([])
+  }
+
+  const attachFromClipboard = async () => {
+    const dataUrl = await window.assistantLite.app.readClipboardImage()
+    if (dataUrl) setAttachments((current) => [...current, dataUrl])
+  }
+
+  // Issue #7 paste-back (polish only): write the result over the original
+  // selection in the source window. The button stays rendered for polish but
+  // is disabled with a hover reason when the payload lacks the fork's hwnd or
+  // the source app name. Success closes the window (the result now lives in
+  // the target app); failure keeps it open with a hint — the clipboard holds
+  // the text either way, so manual paste always works.
+  const [replaceError, setReplaceError] = React.useState<string | null>(null)
+  const replaceDisabled = loading || !hasResult || !payload.hwnd || !payload.programName
+  const replaceTitle = !payload.hwnd
+    ? isZh
+      ? '当前来源不支持替换（未获取窗口句柄）'
+      : 'Replace unavailable (no window handle)'
+    : !payload.programName
+      ? isZh
+        ? '未知来源应用'
+        : 'Unknown source app'
+      : undefined
+
+  const runReplace = async () => {
+    const last = [...chat].reverse().find((turn) => turn.role === 'assistant' && turn.text)
+    if (!last || replaceDisabled) return
+    setReplaceError(null)
+    onReplaceStateChange?.(true)
+    try {
+      const result = await window.assistantLite.selection.replaceSelection({
+        text: getReplacementText(last),
+        selectedText: payload.selectedText,
+        programName: payload.programName,
+        hwnd: payload.hwnd
+      })
+      if (result.ok) {
+        void window.assistantLite.windowControls.close()
+        return
+      }
+      setReplaceError(
+        result.reason === 'window-gone'
+          ? isZh
+            ? '原窗口已关闭，结果已复制，请手动粘贴'
+            : 'Original window is gone — result copied, paste manually'
+          : result.reason === 'selection-changed'
+            ? isZh
+              ? '原选区已变化，结果已复制，请手动粘贴'
+              : 'Selection has changed — result copied, paste manually'
+            : isZh
+              ? '替换失败，结果已复制，请手动粘贴'
+              : 'Replace failed — result copied, paste manually'
+      )
+    } finally {
+      onReplaceStateChange?.(false)
+    }
+  }
+
+  const removeAttachment = (index: number) => {
+    setAttachments((current) => current.filter((_, position) => position !== index))
+  }
+
+  const handlePaste = (event: React.ClipboardEvent) => {
+    const imageFiles = imageFilesFromPaste(event)
+    // Text-only paste: keep the default insertion behavior untouched.
+    if (imageFiles.length === 0) return
+    event.preventDefault()
+    void filesToDataUrls(imageFiles).then((images) => {
+      setAttachments((current) => [...current, ...images])
+    })
   }
 
   return (
@@ -290,30 +459,48 @@ function SelectionResult({ payload, settings, t, pinned, togglePin }: ResultProp
       </div>
 
       {askOpen && (
-        <div className="screenshot-preview__ask">
-          <input
-            ref={askInputRef}
-            type="text"
-            value={askText}
-            placeholder={isZh ? '继续追问…' : 'Ask a follow-up…'}
-            onChange={(e) => setAskText(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') {
-                e.preventDefault()
-                submitAsk()
-              } else if (e.key === 'Escape') {
-                // Esc here closes the follow-up box only — keep it from bubbling
-                // up to the window-level handler that would close the window.
-                e.stopPropagation()
-                setAskOpen(false)
-                setAskText('')
-              }
-            }}
-          />
-          <button className="ask-send" onClick={submitAsk} disabled={!askText.trim() || loading} title={isZh ? '发送' : 'Send'}>
-            <Icon name="arrow-up" size={18} />
-          </button>
-        </div>
+        <>
+          <AttachmentStrip images={attachments} onRemove={removeAttachment} isZh={isZh} />
+          <div className="screenshot-preview__ask">
+            <input
+              ref={askInputRef}
+              type="text"
+              value={askText}
+              placeholder={isZh ? '继续追问…' : 'Ask a follow-up…'}
+              onChange={(e) => setAskText(e.target.value)}
+              onPaste={handlePaste}
+              onKeyDown={(e) => {
+                if (matchesSendKey(e, settings.sendKey)) {
+                  e.preventDefault()
+                  submitAsk()
+                } else if (e.key === 'Enter' && !e.nativeEvent.isComposing) {
+                  // 未命中的 Enter（改配其他发送键后）在单行框无意义，吞掉防默认行为。
+                  // 组合输入中的 Enter 是选字键，不能吞。
+                  e.preventDefault()
+                } else if (e.key === 'Escape') {
+                  // Esc here closes the follow-up box only — keep it from bubbling
+                  // up to the window-level handler that would close the window.
+                  e.stopPropagation()
+                  setAskOpen(false)
+                  setAskText('')
+                }
+              }}
+            />
+            <button
+              className="ask-attach"
+              onClick={() => void attachFromClipboard()}
+              title={isZh ? '插入剪贴板图片' : 'Attach clipboard image'}>
+              <Icon name="image" size={16} />
+            </button>
+            <button
+              className="ask-send"
+              onClick={submitAsk}
+              disabled={(!askText.trim() && attachments.length === 0) || loading}
+              title={isZh ? '发送' : 'Send'}>
+              <Icon name="arrow-up" size={18} />
+            </button>
+          </div>
+        </>
       )}
 
       <div className="footer">
@@ -334,6 +521,12 @@ function SelectionResult({ payload, settings, t, pinned, togglePin }: ResultProp
         <button onClick={() => copyLastResult(chat)} disabled={loading || !hasResult}>
           {t('copy')}
         </button>
+        {payload.action.id === 'polish' && (
+          <button onClick={() => void runReplace()} disabled={replaceDisabled} title={replaceTitle}>
+            {isZh ? '替换' : 'Replace'}
+          </button>
+        )}
+        {replaceError && <span className="replace-hint">{replaceError}</span>}
       </div>
     </div>
   )
@@ -344,7 +537,8 @@ function SelectionResult({ payload, settings, t, pinned, togglePin }: ResultProp
 function InputResult({ payload, settings, t, pinned, togglePin }: ResultProps) {
   const isZh = settings.language === 'zh-CN'
   const showThinking = (payload.action.reasoning ?? 'on') !== 'off'
-  const { chat, setChat, send, stop, loading, hasResult } = useActionStream(payload.action, t)
+  const statsSelection = { programName: payload.programName, selectedText: payload.selectedText }
+  const { chat, setChat, send, stop, loading, hasResult } = useActionStream(payload.action, t, statsSelection)
   const [input, setInput] = React.useState('')
   const inputRef = React.useRef<HTMLTextAreaElement>(null)
   const contentRef = React.useRef<HTMLDivElement>(null)
@@ -411,10 +605,10 @@ function InputResult({ payload, settings, t, pinned, togglePin }: ResultProps) {
           ref={inputRef}
           rows={1}
           value={input}
-          placeholder={isZh ? '输入文本，回车运行…' : 'Type text, Enter to run…'}
+          placeholder={isZh ? '输入文本，按发送键运行…' : 'Type text, press the send key to run…'}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+            if (matchesSendKey(e, settings.sendKey)) {
               e.preventDefault()
               if (loading) stop()
               else submit()
@@ -491,13 +685,19 @@ function ActionApp() {
 
   React.useEffect(() => window.assistantLite.selection.onAction(setPayload), [])
 
+  const replaceBusyRef = React.useRef(false)
+
   React.useEffect(() => {
     const onBlur = () => {
-      if (settings.autoClose && !pinned) void window.assistantLite.windowControls.close()
+      if (settings.autoClose && !pinned && !replaceBusyRef.current) void window.assistantLite.windowControls.close()
     }
     window.addEventListener('blur', onBlur)
     return () => window.removeEventListener('blur', onBlur)
   }, [settings.autoClose, pinned])
+
+  const handleReplaceStateChange = React.useCallback((busy: boolean) => {
+    replaceBusyRef.current = busy
+  }, [])
 
   const togglePin = () => {
     const next = !pinned
@@ -507,7 +707,7 @@ function ActionApp() {
 
   if (!payload) return null
 
-  const shared: ResultProps = { payload, settings, t, pinned, togglePin }
+  const shared: ResultProps = { payload, settings, t, pinned, togglePin, onReplaceStateChange: handleReplaceStateChange }
   // Keyed by action so reusing the window for a different action remounts with
   // fresh state; re-running the same action re-uses the instance.
   return payload.mode === 'input' ? (

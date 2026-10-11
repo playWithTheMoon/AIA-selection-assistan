@@ -1,4 +1,7 @@
 node_modules/
+third_party/selection-hook/node_modules/
+third_party/selection-hook/build/
+/experiments/
 dist/
 out/
 .cache/

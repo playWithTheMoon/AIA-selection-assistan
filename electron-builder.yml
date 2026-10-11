@@ -13,6 +13,7 @@ extraResources:
     to: build/icon.png
 asarUnpack:
   - node_modules/selection-hook/**
+  - node_modules/uiohook-napi/**
 mac:
   icon: build/icon.icns
   category: public.app-category.productivity

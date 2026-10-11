@@ -690,8 +690,16 @@ html[data-theme='dark'] .inline-icon-button:hover {
 .shortcut-recorder {
   width: 100%;
   display: flex;
+  flex-wrap: wrap;
   justify-content: flex-start;
   gap: 8px;
+}
+
+.shortcut-conflict {
+  /* 冲突红字占满一整行，挂在录制框下方 */
+  flex-basis: 100%;
+  color: var(--danger);
+  font-size: 12px;
 }
 
 .shortcut-button {
@@ -1101,6 +1109,12 @@ html[data-theme='dark'] .toolbar-button:hover {
   -webkit-app-region: drag;
 }
 
+/* Non-mac windows have no traffic lights — the 76px mac reservation above
+   would read as a dead gap, so the renderer adds this class there. */
+.titlebar--flush {
+  padding-left: 14px;
+}
+
 .titlebar > svg {
   width: 16px;
   height: 16px;
@@ -1128,12 +1142,25 @@ html[data-theme='dark'] .toolbar-button:hover {
   background: var(--hover);
 }
 
+/* Windows convention: the close button signals destruction with the danger
+   color, distinct from the neutral hover of the other titlebar buttons. */
+.titlebar button.titlebar-close:hover {
+  background: var(--danger);
+  color: #fff;
+}
+
 html[data-theme='dark'] .titlebar {
   background: color-mix(in srgb, var(--panel-solid) 96%, var(--bg));
 }
 
 html[data-theme='dark'] .titlebar button:hover {
   background: rgba(255, 255, 255, 0.045);
+}
+
+/* Same specificity tie-break as above: this must outrank the dark neutral
+   hover rule for the close button's danger background to survive in dark. */
+html[data-theme='dark'] .titlebar button.titlebar-close:hover {
+  background: var(--danger);
 }
 
 .content {
@@ -1666,6 +1693,66 @@ html[data-theme='dark'] .footer button:last-child {
   opacity: 0.3;
   cursor: not-allowed;
 }
+.screenshot-preview__ask .ask-attach {
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  min-height: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+.screenshot-preview__ask .ask-attach:hover {
+  color: var(--text);
+}
+
+/* Pending image attachments, shared by chat / action / preview inputs. */
+.attachment-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 6px 10px 0;
+}
+.attachment-thumb {
+  position: relative;
+  width: 44px;
+  height: 44px;
+  border-radius: 6px;
+  overflow: hidden;
+  border: 1px solid var(--divider);
+}
+.attachment-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.attachment-remove {
+  position: absolute;
+  top: 1px;
+  right: 1px;
+  width: 16px;
+  height: 16px;
+  min-height: 0;
+  border: 0;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+.attachment-remove:hover {
+  background: rgba(0, 0, 0, 0.75);
+}
 
 .screenshot-overlay__toolbar {
   position: absolute;
@@ -1687,10 +1774,17 @@ html[data-theme='dark'] .toolbar-button.toolbar-button--primary:hover {
 
 /* ===== Chat window ===== */
 .chat-content {
+  position: relative;
   padding: 14px;
 }
 .chat-empty {
-  margin: auto;
+  /* Centered in the chat area: the pre-selection panel holds a fixed 30%
+      slot above (by design), so this area's height never changes. */
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -1710,6 +1804,7 @@ html[data-theme='dark'] .toolbar-button.toolbar-button--primary:hover {
   max-width: 260px;
 }
 .chat-input {
+  position: relative;
   display: flex;
   align-items: flex-end;
   gap: 6px;
@@ -1745,6 +1840,7 @@ html[data-theme='dark'] .toolbar-button.toolbar-button--primary:hover {
   flex: 0 0 auto;
   width: 28px;
   height: 28px;
+  min-height: 0;
   border: 0;
   border-radius: 6px;
   background: transparent;
@@ -1841,4 +1937,275 @@ html[data-theme='dark'] .toolbar-button.toolbar-button--primary:hover {
 .action-input__btn:disabled {
   opacity: 0.35;
   cursor: not-allowed;
+}
+
+/* ===== Pre-selection (预选) ===== */
+.toolbar-button--quoted {
+  background: var(--focus);
+  color: #0b7a5f;
+}
+
+.pre-panel {
+    flex: 0 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--divider);
+    /* Secondary-tier tint (same recipe as the titlebar / screenshot thumb):
+       separates the context tray from the conversation instead of leaving
+       two same-colored areas split by a hairline only. */
+    background: color-mix(in srgb, var(--panel-solid) 96%, var(--bg));
+    /* Fixed reservation at the cap (by design): the panel holds its 30%
+       slot from the start so growing entries never squeeze the area below. */
+    min-height: 30%;
+    max-height: 30%;
+    overflow-y: auto;
+  }
+.pre-entry {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+}
+.pre-entry__row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 4px 2px 6px;
+}
+.pre-entry__check {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+}
+.pre-entry__check input {
+  accent-color: var(--accent);
+}
+.pre-entry__main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  background: transparent;
+  color: var(--text-soft);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+  padding: 3px 0;
+}
+.pre-entry__latest {
+  flex: 0 0 auto;
+  font-size: 10px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--focus);
+  color: #0b7a5f;
+}
+.pre-entry__preview {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pre-entry__remove {
+    flex: 0 0 auto;
+    min-height: 0;
+    border: 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  padding: 3px;
+  border-radius: 5px;
+}
+.pre-entry__remove:hover {
+    color: var(--danger);
+    background: var(--hover);
+  }
+  .pre-entry__remove-entry {
+    min-height: 0;
+    align-self: flex-end;
+    border: 0;
+    background: transparent;
+    color: var(--muted);
+    font: inherit;
+    font-size: 10px;
+    padding: 2px 4px;
+    border-radius: 5px;
+    cursor: pointer;
+  }
+  .pre-entry__remove-entry:hover {
+    color: var(--danger);
+    background: var(--hover);
+  }
+.pre-entry--expanded .pre-entry__row {
+  border-bottom: 1px solid var(--divider);
+}
+.pre-entry__body {
+  padding: 6px 8px 6px;
+}
+.pre-entry__text {
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 160px;
+  overflow-y: auto;
+  user-select: text;
+  cursor: text;
+}
+.pre-entry__mark {
+  background: var(--focus);
+  color: #0b7a5f;
+  border-radius: 3px;
+  padding: 0 1px;
+}
+/* Mark number: CSS pseudo-element on purpose — a real text node inside
+   <mark> would shift the TreeWalker offset math for later selections. */
+.pre-entry__mark::after {
+  content: attr(data-num);
+  font-size: 9px;
+  font-weight: 600;
+  vertical-align: super;
+  margin-left: 1px;
+}
+.pre-entry__hint {
+  margin-top: 4px;
+  font-size: 10px;
+  color: var(--muted);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+.pre-entry__marklist {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.pre-entry__marktag {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    min-height: 0;
+    border: 0;
+  border-radius: 5px;
+  background: var(--hover);
+  color: var(--text-soft);
+  font: inherit;
+  font-size: 10px;
+  padding: 1px 5px;
+  cursor: pointer;
+}
+.pre-entry__marktag:hover {
+  color: var(--danger);
+}
+.pre-paper {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px dashed var(--floating-border);
+  border-radius: 8px;
+  padding: 2px 4px 2px 8px;
+  background: var(--control-bg);
+}
+.pre-paper__label {
+  flex: 0 0 auto;
+  font-size: 10px;
+  color: var(--muted);
+}
+.pre-paper__preview {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--text-soft);
+}
+.mark-picker {
+  position: absolute;
+  bottom: 100%;
+  left: 10px;
+  right: 10px;
+  margin-bottom: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px;
+  border: 1px solid var(--floating-border);
+  border-radius: 8px;
+  background: var(--panel-solid);
+  box-shadow: var(--toolbar-floating-shadow);
+  z-index: 5;
+}
+.mark-picker__empty {
+  font-size: 11px;
+  color: var(--muted);
+  padding: 4px 6px;
+}
+.mark-picker__item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  padding: 4px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.mark-picker__item--active {
+  background: var(--hover);
+}
+.mark-picker__item:hover {
+  background: var(--hover);
+}
+.mark-picker__num {
+  flex: 0 0 auto;
+  color: #0b7a5f;
+  font-weight: 600;
+}
+.mark-picker__snippet {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-soft);
+}
+
+/* Dark theme: the mint accents need lighter text to stay readable. */
+html[data-theme='dark'] .toolbar-button--quoted,
+html[data-theme='dark'] .pre-entry__mark,
+html[data-theme='dark'] .pre-entry__latest,
+html[data-theme='dark'] .mark-picker__num {
+  color: #4ade80;
+}
+
+/* Issue #7 paste-back: inline failure hint at the footer's right edge.
+   Theme-neutral on purpose (no new color token): the clipboard already holds
+   the result text, this hint only explains why the paste-back didn't happen. */
+.replace-hint {
+  margin-left: auto;
+  align-self: center;
+  font-size: 12px;
+  opacity: 0.75;
+}
+
+/* Structured output: the model's "why I changed it this way" note, shown under
+   the result body. currentColor keeps it theme-neutral without a new token. */
+.note-hint {
+  margin-top: 8px;
+  padding: 6px 10px;
+  border-left: 2px solid currentColor;
+  font-size: 12px;
+  opacity: 0.7;
+  white-space: pre-wrap;
 }
